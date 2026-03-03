@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, amd
+from triton._C.libtriton import ir, passes, llvm, amd, distributed
 from triton import knobs
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -161,6 +161,7 @@ class HIPBackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
+        distributed.ir.load_dialects(ctx)
         amd.load_dialects(ctx)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
@@ -212,8 +213,9 @@ class HIPBackend(BaseBackend):
     def make_ttgir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
-                                           options.num_ctas)
+        # TritonDistributed Extension
+        distributed.passes.ttir.add_convert_to_ttgpuir_ext(pm, f"hip:{options.arch}", options.num_warps,
+                                                           options.warp_size, options.num_ctas)
         pm.run(mod, 'make_ttgir_early')
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -318,6 +320,8 @@ class HIPBackend(BaseBackend):
         ##    For now it is used as a controller for developers only.
         __HIP_FTZ = True
         amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
+        # TritonDistributed Extension: Distributed/SIMT dialects -> LLVM.
+        distributed.passes.ttgpuir.amd.add_distributed_to_llvm(pm, options.arch, __HIP_FTZ)
         amd.passes.ttgpuir.add_warp_specialize_to_llvm(pm, options.arch)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
@@ -339,6 +343,7 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
+        distributed.passes.ttgpuir.amd.add_builtin_func_to_llvmir_ext(pm, __HIP_FTZ)
         pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
