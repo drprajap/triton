@@ -1,4 +1,5 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonDistributed/Dialect/Distributed/IR/Dialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
@@ -648,6 +649,67 @@ struct PointerCanonicalizationPattern : ConversionPattern {
 
   FatPointers &fatPtrs;
   llvm::SetVector<Operation *> &opToRewrite;
+};
+
+/// Preserve the dependency carried by distributed.consume_token while keeping
+/// a canonicalized pointer split into its base and offset components.
+class ConvertConsumeToken
+    : public PointerCanonicalizationPattern<
+          triton::distributed::ConsumeTokenOp> {
+public:
+  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
+
+  LogicalResult
+  matchAndRewrite_(triton::distributed::ConsumeTokenOp consumeTokenOp,
+                   OneToNOpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+    ValueRange remappedOperands = adaptor.getInput();
+    if (remappedOperands.size() != 2)
+      return success();
+
+    Value fatPtrBase = remappedOperands[0];
+    Value fatPtrOffset = remappedOperands[1];
+    if (!llvm::isa<tt::PointerType>(fatPtrBase.getType()))
+      return rewriter.notifyMatchFailure(consumeTokenOp,
+                                         "non tt.ptr base unimplemented");
+
+    auto newConsumeTokenOp = triton::distributed::ConsumeTokenOp::create(
+        rewriter, consumeTokenOp.getLoc(), fatPtrBase, adaptor.getToken()[0]);
+    rewriter.replaceOpWithMultiple(consumeTokenOp,
+                                   {{newConsumeTokenOp, fatPtrOffset}});
+    fatPtrs[{newConsumeTokenOp, fatPtrOffset}] =
+        fatPtrs.at({fatPtrBase, fatPtrOffset});
+    return success();
+  }
+};
+
+/// Apply distributed.symm_at to the base address and retain the local offset.
+class ConvertSymmAt
+    : public PointerCanonicalizationPattern<triton::distributed::SymmAtOp> {
+public:
+  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
+
+  LogicalResult
+  matchAndRewrite_(triton::distributed::SymmAtOp symmAtOp,
+                   OneToNOpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+    ValueRange remappedOperands = adaptor.getSymmAddr();
+    if (remappedOperands.size() != 2)
+      return success();
+
+    Value fatPtrBase = remappedOperands[0];
+    Value fatPtrOffset = remappedOperands[1];
+    if (!llvm::isa<tt::PointerType>(fatPtrBase.getType()))
+      return rewriter.notifyMatchFailure(symmAtOp,
+                                         "non tt.ptr base unimplemented");
+
+    auto newSymmAtOp = triton::distributed::SymmAtOp::create(
+        rewriter, symmAtOp.getLoc(), fatPtrBase, adaptor.getRank()[0]);
+    rewriter.replaceOpWithMultiple(symmAtOp, {{newSymmAtOp, fatPtrOffset}});
+    fatPtrs[{newSymmAtOp, fatPtrOffset}] =
+        fatPtrs.at({fatPtrBase, fatPtrOffset});
+    return success();
+  }
 };
 
 /// splat integer offset, keep base
@@ -1983,6 +2045,8 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   target.addDynamicallyLegalDialect<scf::SCFDialect>(isLegal);
   target.addDynamicallyLegalDialect<cf::ControlFlowDialect>(isLegal);
   target.addDynamicallyLegalDialect<arith::ArithDialect>(isLegal);
+  target.addDynamicallyLegalDialect<triton::distributed::DistributedDialect>(
+      isLegal);
   target.addDynamicallyLegalDialect<triton::amdgpu::TritonAMDGPUDialect>(
       isLegal);
 
@@ -1997,6 +2061,10 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   patterns.add<
       ConvertFuncOpArgsUnrealizedCasts, ConvertBroadcastOp, ConvertSplatOp,
       ConvertConvertLayoutOp, ConvertAddPtrOp, ConvertExtractSliceOp,
+      ConvertConsumeToken, ConvertSymmAt,
+      MaterializeFatPointer<triton::distributed::WaitOp>,
+      MaterializeFatPointer<triton::distributed::NotifyOp>,
+      MaterializeFatPointer<triton::distributed::SymmAtOp>,
       MaterializeFatPointer<tt::AtomicCASOp>,
       MaterializeFatPointer<tt::AtomicRMWOp>,
       MaterializeFatPointer<tt::BitcastOp>, MaterializeFatPointer<tt::LoadOp>,
@@ -2006,7 +2074,9 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       MaterializeFatPointerVariadic<tt::CallOp>,
       MaterializeFatPointerVariadic<tt::ExternElementwiseOp>,
       MaterializeFatPointerVariadic<tt::ElementwiseInlineAsmOp>,
-      MaterializeFatPointerVariadic<tt::PrintOp>, ConvertSCFForOp,
+      MaterializeFatPointerVariadic<tt::PrintOp>,
+      MaterializeFatPointerVariadic<triton::distributed::ExternCallOp>,
+      ConvertSCFForOp,
       ConvertExpandDims, ConvertSCFYieldOp, ConvertSCFIfOp,
       ConvertSCFConditionOp, ConvertSCFWhileOp, ConvertCFCondBranch,
       ConvertCFBranch, ConvertArithSelectOp, ConvertReturnOp>(
